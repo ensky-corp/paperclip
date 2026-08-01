@@ -2484,6 +2484,44 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
+  it("persists an explicit execution workspace preference on create", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Isolated workspace issue",
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    expect(issue.executionWorkspacePreference).toBe("isolated_workspace");
+  });
+
+  it("persists an explicit execution workspace preference on update", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const issue = await svc.create(companyId, {
+      title: "Shared workspace issue",
+    });
+    const updated = await svc.update(issue.id, {
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    expect(updated?.executionWorkspacePreference).toBe("isolated_workspace");
+  });
+
   it("inherits the parent issue workspace linkage when child workspace fields are omitted", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();
