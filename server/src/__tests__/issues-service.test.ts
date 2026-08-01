@@ -2484,8 +2484,11 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await tempDb?.cleanup();
   });
 
-  it("persists an explicit execution workspace preference on create", async () => {
+  it("keeps an explicit child workspace preference when isolated workspaces are disabled", async () => {
     const companyId = randomUUID();
+    const projectId = randomUUID();
+    const parentIssueId = randomUUID();
+    const parentExecutionWorkspaceId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -2493,13 +2496,47 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
     });
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: false });
+
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace project",
+      status: "in_progress",
+    });
+
+    await db.insert(executionWorkspaces).values({
+      id: parentExecutionWorkspaceId,
+      companyId,
+      projectId,
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      name: "Parent workspace",
+      status: "active",
+      providerType: "local_fs",
+    });
+
+    await db.insert(issues).values({
+      id: parentIssueId,
+      companyId,
+      projectId,
+      title: "Parent issue",
+      status: "in_progress",
+      priority: "medium",
+      executionWorkspaceId: parentExecutionWorkspaceId,
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "shared_workspace" },
+    });
 
     const issue = await svc.create(companyId, {
-      title: "Isolated workspace issue",
+      parentId: parentIssueId,
+      title: "Isolated child issue",
       executionWorkspacePreference: "isolated_workspace",
     });
 
     expect(issue.executionWorkspacePreference).toBe("isolated_workspace");
+    expect(issue.executionWorkspaceId).toBeNull();
+    expect(issue.executionWorkspaceSettings).toBeNull();
   });
 
   it("persists an explicit execution workspace preference on update", async () => {
