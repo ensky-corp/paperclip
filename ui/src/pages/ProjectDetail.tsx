@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Link, useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { PROJECT_COLORS, isUuidLike, type BudgetPolicySummary } from "@paperclipai/shared";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { PROJECT_COLORS, isUuidLike, type BudgetPolicySummary, type Issue } from "@paperclipai/shared";
 import { budgetsApi } from "../api/budgets";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { instanceSettingsApi } from "../api/instanceSettings";
@@ -156,8 +156,20 @@ function ColorPicker({
 
 /* ── List (issues) tab content ── */
 
+const PROJECT_ISSUES_PAGE_SIZE = 500;
+
+function mergeProjectIssuePages(pages: Issue[][]): Issue[] {
+  const seenIssueIds = new Set<string>();
+  return pages.flatMap((page) => page.filter((issue) => {
+    if (seenIssueIds.has(issue.id)) return false;
+    seenIssueIds.add(issue.id);
+    return true;
+  }));
+}
+
 function ProjectIssuesList({ projectId, companyId }: { projectId: string; companyId: string }) {
   const queryClient = useQueryClient();
+  const fetchNextPageInFlightRef = useRef(false);
 
   const { data: agents } = useQuery({
     queryKey: queryKeys.agents.list(companyId),
@@ -179,11 +191,36 @@ function ProjectIssuesList({ projectId, companyId }: { projectId: string; compan
 
   const liveIssueIds = useMemo(() => collectLiveIssueIds(liveRuns), [liveRuns]);
 
-  const { data: issues, isLoading, error } = useQuery({
-    queryKey: queryKeys.issues.listByProject(companyId, projectId),
-    queryFn: () => issuesApi.list(companyId, { projectId }),
+  const {
+    data: issuePages,
+    isLoading,
+    isFetchingNextPage,
+    error,
+    hasNextPage,
+    fetchNextPage,
+  } = useInfiniteQuery({
+    queryKey: [...queryKeys.issues.listByProject(companyId, projectId), "infinite", PROJECT_ISSUES_PAGE_SIZE],
+    queryFn: ({ pageParam }) => issuesApi.list(companyId, {
+      projectId,
+      limit: PROJECT_ISSUES_PAGE_SIZE,
+      offset: pageParam,
+    }),
+    initialPageParam: 0,
+    getNextPageParam: (lastPage, _allPages, lastPageParam) =>
+      lastPage.length >= PROJECT_ISSUES_PAGE_SIZE
+        ? lastPageParam + PROJECT_ISSUES_PAGE_SIZE
+        : undefined,
     enabled: !!companyId,
+    placeholderData: (previousData) => previousData,
   });
+  const issues = useMemo(() => mergeProjectIssuePages(issuePages?.pages ?? []), [issuePages]);
+  const loadMoreIssues = useCallback(() => {
+    if (!hasNextPage || isFetchingNextPage || fetchNextPageInFlightRef.current) return;
+    fetchNextPageInFlightRef.current = true;
+    void fetchNextPage({ cancelRefetch: false }).finally(() => {
+      fetchNextPageInFlightRef.current = false;
+    });
+  }, [fetchNextPage, hasNextPage, isFetchingNextPage]);
 
   const updateIssue = useMutation({
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>
@@ -198,12 +235,15 @@ function ProjectIssuesList({ projectId, companyId }: { projectId: string; compan
     <IssuesList
       issues={issues ?? []}
       isLoading={isLoading}
+      isLoadingMoreIssues={isFetchingNextPage}
       error={error as Error | null}
       agents={agents}
       projects={projects}
       liveIssueIds={liveIssueIds}
       projectId={projectId}
       viewStateKey="paperclip:project-issues-view"
+      hasMoreIssues={hasNextPage === true}
+      onLoadMoreIssues={loadMoreIssues}
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
     />
   );

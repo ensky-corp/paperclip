@@ -27,6 +27,7 @@ const mockAssetsApi = vi.hoisted(() => ({ uploadImage: vi.fn() }));
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockIssuesList = vi.hoisted(() => vi.fn());
+const mockLocation = vi.hoisted(() => ({ pathname: "/projects/project-1/plugin-operations" }));
 
 vi.mock("../api/projects", () => ({ projectsApi: mockProjectsApi }));
 vi.mock("../api/issues", () => ({ issuesApi: mockIssuesApi }));
@@ -40,7 +41,7 @@ vi.mock("../api/assets", () => ({ assetsApi: mockAssetsApi }));
 vi.mock("@/lib/router", () => ({
   Link: ({ children, to }: { children?: ReactNode; to: string }) => <a href={to}>{children}</a>,
   Navigate: ({ to }: { to: string }) => <div data-testid="navigate">{to}</div>,
-  useLocation: () => ({ pathname: "/projects/project-1/plugin-operations", search: "", hash: "", state: null }),
+  useLocation: () => ({ pathname: mockLocation.pathname, search: "", hash: "", state: null }),
   useNavigate: () => mockNavigate,
   useParams: () => ({ projectId: "project-1" }),
 }));
@@ -142,6 +143,7 @@ describe("ProjectDetail", () => {
   let container: HTMLDivElement;
 
   beforeEach(() => {
+    mockLocation.pathname = "/projects/project-1/plugin-operations";
     container = document.createElement("div");
     document.body.appendChild(container);
     mockProjectsApi.get.mockResolvedValue(project());
@@ -182,6 +184,60 @@ describe("ProjectDetail", () => {
     expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
       projectId: "project-1",
       originKindPrefix: "plugin:paperclip.missions",
+    });
+  });
+
+  it("loads subsequent project issue pages and merges them into the list", async () => {
+    mockLocation.pathname = "/projects/project-1/issues";
+    const firstPage = Array.from({ length: 500 }, (_, index) => ({ id: `issue-${index}` }));
+    const secondPage = [{ id: "issue-500" }];
+    mockIssuesApi.list.mockImplementation(
+      (_companyId: string, filters?: { projectId?: string; limit?: number; offset?: number }) => {
+        if (filters?.projectId !== "project-1" || filters.limit !== 500) return Promise.resolve([]);
+        return Promise.resolve(filters.offset === 500 ? secondPage : firstPage);
+      },
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ProjectDetail />
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+      projectId: "project-1",
+      limit: 500,
+      offset: 0,
+    });
+    expect(mockIssuesList.mock.calls.at(-1)?.[0]).toMatchObject({
+      issues: firstPage,
+      hasMoreIssues: true,
+      isLoadingMoreIssues: false,
+    });
+
+    await act(async () => {
+      mockIssuesList.mock.calls.at(-1)?.[0].onLoadMoreIssues();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", {
+      projectId: "project-1",
+      limit: 500,
+      offset: 500,
+    });
+    expect(mockIssuesList.mock.calls.at(-1)?.[0]).toMatchObject({
+      issues: [...firstPage, ...secondPage],
+      hasMoreIssues: false,
+      isLoadingMoreIssues: false,
     });
   });
 });
