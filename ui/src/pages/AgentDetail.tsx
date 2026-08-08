@@ -291,6 +291,17 @@ function runMetrics(run: HeartbeatRun) {
 
 type RunLogChunk = { ts: string; stream: "stdout" | "stderr" | "system"; chunk: string };
 
+export function shouldLoadPersistedRunLog({
+  status,
+  logRef,
+  logBytes,
+  lastOutputBytes,
+}: Pick<HeartbeatRun, "status" | "logRef" | "logBytes" | "lastOutputBytes">) {
+  if (!logRef) return false;
+  if (status === "running" || status === "queued") return true;
+  return Math.max(logBytes ?? 0, lastOutputBytes ?? 0) > 0;
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   return value as Record<string, unknown>;
@@ -3487,7 +3498,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
   const [events, setEvents] = useState<HeartbeatRunEvent[]>([]);
   const [logLines, setLogLines] = useState<Array<{ ts: string; stream: "stdout" | "stderr" | "system"; chunk: string }>>([]);
   const [loading, setLoading] = useState(true);
-  const [logLoading, setLogLoading] = useState(!!run.logRef);
+  const [logLoading, setLogLoading] = useState(() => shouldLoadPersistedRunLog(run));
   const [logError, setLogError] = useState<string | null>(null);
   const [logOffset, setLogOffset] = useState(0);
   const [hasMoreLog, setHasMoreLog] = useState(false);
@@ -3504,6 +3515,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
     distanceFromBottom: Number.POSITIVE_INFINITY,
   });
   const isLive = run.status === "running" || run.status === "queued";
+  const shouldLoadLog = shouldLoadPersistedRunLog(run);
   const { data: workspaceOperations = [] } = useQuery({
     queryKey: queryKeys.runWorkspaceOperations(run.id),
     queryFn: () => heartbeatsApi.workspaceOperations(run.id),
@@ -3650,7 +3662,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
     setLoadingMoreLog(false);
     setLogError(null);
 
-    if (!run.logRef && !isLive) {
+    if (!shouldLoadLog) {
       setLogLoading(false);
       return () => {
         cancelled = true;
@@ -3683,7 +3695,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
     return () => {
       cancelled = true;
     };
-  }, [run.id, run.logRef, run.logBytes, isLive]);
+  }, [run.id, run.status, run.logRef, run.logBytes, run.lastOutputBytes, isLive, shouldLoadLog]);
 
   async function loadMorePersistedLog() {
     if (loadingMoreLog || !hasMoreLog) return;
@@ -3966,7 +3978,7 @@ function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType: strin
           entries={transcript}
           mode={transcriptMode}
           streaming={isLive}
-          emptyMessage={run.logRef ? "Waiting for transcript..." : "No persisted transcript for this run."}
+          emptyMessage={shouldLoadLog ? "Waiting for transcript..." : "No persisted transcript for this run."}
         />
         {hasMoreLog && (
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-border/60 pt-3">
