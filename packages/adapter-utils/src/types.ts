@@ -137,6 +137,8 @@ export interface AdapterExecutionContext {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  /** Aborted by the control plane before it starts terminating a cancelled run. */
+  abortSignal?: AbortSignal;
   authToken?: string;
 }
 
