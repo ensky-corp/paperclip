@@ -1844,6 +1844,59 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs.some((run) => run.status === "scheduled_retry" && run.retryOfRunId === runId)).toBe(false);
   });
 
+  it("does not overwrite a coalesced wakeup when its run completes", async () => {
+    const { runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    let finishAdapter!: () => void;
+    const adapterFinished = new Promise<void>((resolve) => {
+      finishAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await adapterFinished;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => {
+      const run = await heartbeat.getRun(runId);
+      return run?.status === "running" ? run : null;
+    }, 5_000);
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "coalesced", finishedAt: new Date() })
+      .where(eq(agentWakeupRequests.id, wakeupRequestId));
+    finishAdapter();
+
+    const completed = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(completed?.status).toBe("succeeded");
+    await waitForValue(
+      () =>
+        db
+          .select()
+          .from(heartbeatRunEvents)
+          .where(
+            and(
+              eq(heartbeatRunEvents.runId, runId),
+              eq(heartbeatRunEvents.eventType, "lifecycle"),
+              eq(heartbeatRunEvents.message, "run succeeded"),
+            ),
+          )
+          .then((rows) => rows[0] ?? null),
+      5_000,
+    );
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("coalesced");
+  });
+
   it("keeps a completed run succeeded while terminating a residual child on cancel", async () => {
     const { runId } = await seedQueuedIssueRunFixture();
     const heartbeat = heartbeatService(db);
