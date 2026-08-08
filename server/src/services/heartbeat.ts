@@ -2331,6 +2331,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   });
   const workspaceOperationsSvc = workspaceOperationService(db);
   const activeRunExecutions = new Set<string>();
+  const runAbortControllers = new Map<string, AbortController>();
   const budgetHooks = {
     cancelWorkForScope: cancelBudgetScopeWork,
   };
@@ -4303,7 +4304,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         processStartedAt: Number.isNaN(startedAt.getTime()) ? new Date() : startedAt,
         updatedAt: new Date(),
       })
-      .where(eq(heartbeatRuns.id, runId))
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
       .returning()
       .then((rows) => rows[0] ?? null);
   }
@@ -6770,6 +6771,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     activeRunExecutions.add(run.id);
+    const abortController = new AbortController();
+    runAbortControllers.set(run.id, abortController);
 
     try {
     const agent = await getAgent(run.agentId);
@@ -7656,6 +7659,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      const currentRunBeforeAdapterExecution = await getRun(run.id);
+      if (abortController.signal.aborted || isHeartbeatRunTerminalStatus(currentRunBeforeAdapterExecution?.status)) {
+        return;
+      }
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -7670,7 +7677,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         onLog,
         onMeta: onAdapterMeta,
         onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, {
+          const persisted = await persistRunProcessMetadata(run.id, {
             pid: meta.pid,
             processGroupId:
               "processGroupId" in meta && typeof meta.processGroupId === "number"
@@ -7678,7 +7685,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 : null,
             startedAt: meta.startedAt,
           });
+          if (!persisted) {
+            await terminateHeartbeatRunProcess({
+              pid: meta.pid,
+              processGroupId: meta.processGroupId,
+            });
+          }
         },
+        abortSignal: abortController.signal,
         authToken: authToken ?? undefined,
       });
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
@@ -8074,6 +8088,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // DB calls threw (e.g. a transient DB error in finalizeAgentStatus).
           await finalizeAgentStatus(run.agentId, "failed").catch(() => undefined);
         } finally {
+          if (runAbortControllers.get(run.id) === abortController) {
+            runAbortControllers.delete(run.id);
+          }
           const latestRun = await getRun(run.id).catch(() => null);
           await releaseEnvironmentLeasesForRun({
             runId: run.id,
@@ -9342,19 +9359,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!CANCELLABLE_HEARTBEAT_RUN_STATUSES.includes(run.status as (typeof CANCELLABLE_HEARTBEAT_RUN_STATUSES)[number])) return run;
     const agent = await getAgent(run.agentId);
 
-    const running = runningProcesses.get(run.id);
-    if (running) {
-      await terminateHeartbeatRunProcess({
-        pid: running.child.pid ?? run.processPid,
-        processGroupId: running.processGroupId ?? run.processGroupId,
-        graceMs: Math.max(1, running.graceSec) * 1000,
-      });
-    } else if (run.processPid || run.processGroupId) {
-      await terminateHeartbeatRunProcess({
-        pid: run.processPid,
-        processGroupId: run.processGroupId,
-      });
-    }
+    // Adapter supervisors can start a new child after a cancelled child exits.
+    // Abort before changing persistent state or signalling a process so they
+    // cannot cross the cancellation boundary while the database is updating.
+    runAbortControllers.get(run.id)?.abort();
 
     const cancelled = await setRunStatus(run.id, "cancelled", {
       finishedAt: new Date(),
@@ -9373,6 +9381,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       finishedAt: new Date(),
       error: reason,
     });
+
+    // Read again after the terminal transition. A child can have registered in
+    // the small window before the status update acquired its row lock; that
+    // child must still be included in this cancellation.
+    const runAfterCancellation = await getRun(run.id);
+    const running = runningProcesses.get(run.id);
+    if (running) {
+      await terminateHeartbeatRunProcess({
+        pid: running.child.pid ?? runAfterCancellation?.processPid ?? run.processPid,
+        processGroupId:
+          running.processGroupId ?? runAfterCancellation?.processGroupId ?? run.processGroupId,
+        graceMs: Math.max(1, running.graceSec) * 1000,
+      });
+    } else if (runAfterCancellation?.processPid || runAfterCancellation?.processGroupId) {
+      await terminateHeartbeatRunProcess({
+        pid: runAfterCancellation.processPid,
+        processGroupId: runAfterCancellation.processGroupId,
+      });
+    }
 
     if (cancelled) {
       await appendRunEvent(cancelled, 1, {

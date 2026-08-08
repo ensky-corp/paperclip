@@ -1752,6 +1752,98 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("aborts the adapter and rejects a child registration that races with cancellation", async () => {
+    const { runId } = await seedQueuedIssueRunFixture();
+    let adapterContext: {
+      abortSignal?: AbortSignal;
+      onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    } | null = null;
+    let finishAdapter!: () => void;
+    const adapterFinished = new Promise<void>((resolve) => {
+      finishAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: typeof adapterContext) => {
+      adapterContext = ctx;
+      await adapterFinished;
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "transient_upstream",
+        errorFamily: "transient_upstream",
+        errorMessage: "provider stopped normally after cancellation",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => adapterContext, 5_000);
+    expect(adapterContext?.abortSignal?.aborted).toBe(false);
+
+    await heartbeat.cancelRun(runId);
+    expect(adapterContext?.abortSignal?.aborted).toBe(true);
+
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const pid = child.pid;
+    if (!pid) throw new Error("Expected a child pid");
+    await adapterContext?.onSpawn?.({
+      pid,
+      processGroupId: null,
+      startedAt: new Date().toISOString(),
+    });
+    finishAdapter();
+
+    expect(await waitForPidExit(pid)).toBe(true);
+    const cancelled = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(cancelled?.status).toBe("cancelled");
+    expect(cancelled?.processPid).toBeNull();
+  });
+
+  it("terminates a child that registered immediately before cancellation", async () => {
+    const { runId } = await seedQueuedIssueRunFixture();
+    let adapterContext: {
+      onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    } | null = null;
+    let finishAdapter!: () => void;
+    const adapterFinished = new Promise<void>((resolve) => {
+      finishAdapter = resolve;
+    });
+    mockAdapterExecute.mockImplementationOnce(async (ctx: typeof adapterContext) => {
+      adapterContext = ctx;
+      await adapterFinished;
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "transient_upstream",
+        errorFamily: "transient_upstream",
+        errorMessage: "provider stopped normally after cancellation",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => adapterContext, 5_000);
+
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const pid = child.pid;
+    if (!pid) throw new Error("Expected a child pid");
+    await adapterContext?.onSpawn?.({
+      pid,
+      processGroupId: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    await heartbeat.cancelRun(runId);
+    finishAdapter();
+
+    expect(await waitForPidExit(pid)).toBe(true);
+    const cancelled = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(cancelled?.status).toBe("cancelled");
+  });
+
   it("dispatches assigned todo work with no prior run as a normal assignment wake", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
     const heartbeat = heartbeatService(db);
