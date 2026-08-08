@@ -1800,6 +1800,70 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(cancelled?.processPid).toBeNull();
   });
 
+  it("keeps a concurrent adapter completion cancelled without duplicate terminal events", async () => {
+    const { runId, wakeupRequestId } = await seedQueuedIssueRunFixture();
+    let adapterContext: { abortSignal?: AbortSignal } | null = null;
+    mockAdapterExecute.mockImplementationOnce(async (ctx: typeof adapterContext) => {
+      adapterContext = ctx;
+      await new Promise<void>((resolve) => ctx.abortSignal?.addEventListener("abort", () => resolve(), { once: true }));
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorCode: "transient_upstream",
+        errorFamily: "transient_upstream",
+        errorMessage: "adapter returned immediately after cancellation",
+      };
+    });
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForValue(async () => adapterContext, 5_000);
+    await heartbeat.cancelRun(runId);
+
+    const cancelled = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(cancelled?.status).toBe("cancelled");
+    const wakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wakeupRequestId))
+      .then((rows) => rows[0] ?? null);
+    expect(wakeup?.status).toBe("cancelled");
+
+    const terminalEvents = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "lifecycle")));
+    const terminalLifecycleEvents = terminalEvents.filter((event) =>
+      ["run succeeded", "run failed", "run cancelled", "run timed_out"].includes(event.message ?? ""),
+    );
+    expect(terminalLifecycleEvents).toHaveLength(1);
+    expect(terminalLifecycleEvents[0]?.message).toBe("run cancelled");
+
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, cancelled?.agentId ?? ""));
+    expect(runs.some((run) => run.status === "scheduled_retry" && run.retryOfRunId === runId)).toBe(false);
+  });
+
+  it("keeps a completed run succeeded while terminating a residual child on cancel", async () => {
+    const { runId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    const succeeded = await waitForRunToSettle(heartbeat, runId, 5_000);
+    expect(succeeded?.status).toBe("succeeded");
+
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const pid = child.pid;
+    if (!pid) throw new Error("Expected a residual child pid");
+    runningProcesses.set(runId, { child, graceSec: 1, processGroupId: null });
+
+    const result = await heartbeat.cancelRun(runId);
+    expect(result?.status).toBe("succeeded");
+    expect(await waitForPidExit(pid)).toBe(true);
+    expect(runningProcesses.has(runId)).toBe(false);
+  });
+
   it("terminates a child that registered immediately before cancellation", async () => {
     const { runId } = await seedQueuedIssueRunFixture();
     let adapterContext: {
